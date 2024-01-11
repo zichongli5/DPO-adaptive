@@ -43,17 +43,17 @@ class ScriptArguments:
     learning_rate: Optional[float] = field(default=1e-3, metadata={"help": "optimizer learning rate"})
     per_device_train_batch_size: Optional[int] = field(default=1, metadata={"help": "batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
-        default=4, metadata={"help": "the number of gradient accumulation steps"}
+        default=1, metadata={"help": "the number of gradient accumulation steps"}
     )
     max_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample"})
-    max_prompt_length: Optional[int] = field(default=128, metadata={"help": "max length of each sample's prompt"})
+    max_prompt_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample's prompt"})
     max_target_length: Optional[int] = field(
-        default=128, metadata={"help": "Only used for encoder decoder model. Max target of each sample's prompt"}
+        default=512, metadata={"help": "Only used for encoder decoder model. Max target of each sample's prompt"}
     )
     label_pad_token_id: Optional[int] = field(default=-100, metadata={"help": "label for non response tokens"})
     max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
     # lora parameters
-    use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
+    use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
     peft_lora_r: Optional[int] = field(default=16, metadata={"help": "the r parameter of the LoRA adapters"})
     peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
     # instrumentation
@@ -150,7 +150,10 @@ if __name__ == "__main__":
     script_args = parser.parse_args_into_dataclasses()[0]
 
     # 1. load a pretrained model
-    model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path,
+                                                low_cpu_mem_usage=True,
+                                                torch_dtype=torch.float16
+                                                )
 
     if script_args.ignore_bias_buffers:
         # torch distributed hack
@@ -158,7 +161,8 @@ if __name__ == "__main__":
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    model_ref = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+    # model_ref = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+    model_ref = create_reference_model(model)
 
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
     if tokenizer.pad_token is None:
