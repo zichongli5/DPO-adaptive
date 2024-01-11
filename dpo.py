@@ -25,8 +25,7 @@ from datasets import Dataset, load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
 from transformers import LlamaForCausalLM, LlamaTokenizer
-from trl import DPOTrainer
-
+from trl import DPOTrainer, create_reference_model
 
 # Define and parse arguments.
 @dataclass
