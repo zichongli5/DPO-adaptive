@@ -25,7 +25,8 @@ from datasets import Dataset, load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
 from transformers import LlamaForCausalLM, LlamaTokenizer
-from trl import DPOTrainer, create_reference_model
+from trl import create_reference_model
+from dpo_trainer import DPOTrainer
 
 # Define and parse arguments.
 @dataclass
@@ -39,18 +40,18 @@ class ScriptArguments:
 
     # training parameters
     model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
-    learning_rate: Optional[float] = field(default=1e-3, metadata={"help": "optimizer learning rate"})
+    learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
     per_device_train_batch_size: Optional[int] = field(default=1, metadata={"help": "batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
-        default=1, metadata={"help": "the number of gradient accumulation steps"}
+        default=8, metadata={"help": "the number of gradient accumulation steps"}
     )
     max_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample"})
     max_prompt_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample's prompt"})
     max_target_length: Optional[int] = field(
-        default=512, metadata={"help": "Only used for encoder decoder model. Max target of each sample's prompt"}
+        default=128, metadata={"help": "Only used for encoder decoder model. Max target of each sample's prompt"}
     )
     label_pad_token_id: Optional[int] = field(default=-100, metadata={"help": "label for non response tokens"})
-    max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
+    max_steps: Optional[int] = field(default=2048, metadata={"help": "max number of training steps"})
     # lora parameters
     use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
     peft_lora_r: Optional[int] = field(default=16, metadata={"help": "the r parameter of the LoRA adapters"})
@@ -151,7 +152,7 @@ if __name__ == "__main__":
     # 1. load a pretrained model
     model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path,
                                                 low_cpu_mem_usage=True,
-                                                torch_dtype=torch.float16
+                                                torch_dtype=torch.bfloat16
                                                 )
 
     if script_args.ignore_bias_buffers:
@@ -169,6 +170,14 @@ if __name__ == "__main__":
 
     # 2. Load the Anthropic Helpful-Harmless dataset
     train_dataset = get_summarize("train")
+    # lengths_prompt = [len(entry.split()) for entry in train_dataset['prompt']]
+    # lengths_label = [len(entry.split()) for entry in train_dataset['chosen']] + [len(entry.split()) for entry in train_dataset['rejected']]
+    # # Calculate quantiles
+    # import numpy as np
+    # quantiles = np.percentile(lengths_prompt, [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+    # print(f"Percentile Prompt: {quantiles}")
+    # quantiles = np.percentile(lengths_label, [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+    # print(f"Percentile Label: {quantiles}")
 
     # 3. Load evaluation dataset
     eval_dataset = get_summarize("validation")
@@ -216,8 +225,9 @@ if __name__ == "__main__":
         max_length=script_args.max_length,
         max_target_length=script_args.max_target_length,
         max_prompt_length=script_args.max_prompt_length,
-        generate_during_eval=True,
+        generate_during_eval=False,
         peft_config=peft_config,
+        # precompute_ref_log_probs = True
     )
 
     # 6. train
