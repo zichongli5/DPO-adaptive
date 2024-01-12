@@ -98,7 +98,7 @@ def construct_summarize_prompt(prompt):
     # return "SUBREDDIT: " + prompt['subreddit'] + " " + "TITLE: " + prompt['title'] + " " + "POST: " + prompt['post']
     return "SUBREDDIT: " + subreddit + " " + "TITLE: " + title + " " + "POST: " + post
 
-def get_summarize(split: str, silent: bool = False, cache_dir: str = None) -> Dataset:
+def get_summarize(split: str, silent: bool = False, cache_dir: str = '~/.cache/huggingface/datasets') -> Dataset:
     print(f'Loading OpenAI summarization dataset ({split} split) from Huggingface...')
     dataset = load_dataset('openai/summarize_from_feedback', 'comparisons', split=split, cache_dir=cache_dir)
     print('done')
