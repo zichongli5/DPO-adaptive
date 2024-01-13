@@ -37,13 +37,15 @@ class ScriptArguments:
 
     # data parameters
     beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for DPO loss"})
+    
+    adaptive_temp: Optional[bool] = field(default=False, metadata={"help": ""})
 
     # training parameters
     model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
-    per_device_train_batch_size: Optional[int] = field(default=1, metadata={"help": "batch size per device"})
+    per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
-        default=8, metadata={"help": "the number of gradient accumulation steps"}
+        default=4, metadata={"help": "the number of gradient accumulation steps"}
     )
     max_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample"})
     max_prompt_length: Optional[int] = field(default=512, metadata={"help": "max length of each sample's prompt"})
@@ -53,8 +55,8 @@ class ScriptArguments:
     label_pad_token_id: Optional[int] = field(default=-100, metadata={"help": "label for non response tokens"})
     max_steps: Optional[int] = field(default=2048, metadata={"help": "max number of training steps"})
     # lora parameters
-    use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
-    peft_lora_r: Optional[int] = field(default=16, metadata={"help": "the r parameter of the LoRA adapters"})
+    use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
+    peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
     peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
     # instrumentation
     sanity_check: Optional[bool] = field(default=True, metadata={"help": "only train on 1000 samples"})
@@ -99,12 +101,13 @@ def construct_summarize_prompt(prompt):
     # return "SUBREDDIT: " + prompt['subreddit'] + " " + "TITLE: " + prompt['title'] + " " + "POST: " + prompt['post']
     return "SUBREDDIT: " + subreddit + " " + "TITLE: " + title + " " + "POST: " + post
 
-def get_summarize(split: str, silent: bool = False, cache_dir: str = '~/.cache/huggingface/datasets') -> Dataset:
+def get_summarize(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: str = '~/.cache/huggingface/datasets') -> Dataset:
     print(f'Loading OpenAI summarization dataset ({split} split) from Huggingface...')
     dataset = load_dataset('openai/summarize_from_feedback', 'comparisons', split=split, cache_dir=cache_dir)
     print('done')
     # # select only the first 1000 samples
-    # dataset = dataset.select(range(min(len(dataset), 1000)))
+    if sanity_check:
+        dataset = dataset.select(range(min(len(dataset), 1000)))
 
     def split_prompt_and_responses(sample) -> Dict[str, str]:
         return {
@@ -169,7 +172,7 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     # 2. Load the Anthropic Helpful-Harmless dataset
-    train_dataset = get_summarize("train")
+    train_dataset = get_summarize("train", sanity_check=script_args.sanity_check)
     # lengths_prompt = [len(entry.split()) for entry in train_dataset['prompt']]
     # lengths_label = [len(entry.split()) for entry in train_dataset['chosen']] + [len(entry.split()) for entry in train_dataset['rejected']]
     # # Calculate quantiles
@@ -180,7 +183,7 @@ if __name__ == "__main__":
     # print(f"Percentile Label: {quantiles}")
 
     # 3. Load evaluation dataset
-    eval_dataset = get_summarize("validation")
+    eval_dataset = get_summarize("validation", sanity_check=script_args.sanity_check)
 
     # 4. initialize training arguments:
     training_args = TrainingArguments(
@@ -213,6 +216,8 @@ if __name__ == "__main__":
     else:
         peft_config = None
 
+    if script_args.adaptive_temp:
+        print("Using adaptive temperature !!!!!")
     # 5. initialize the DPO trainer
     dpo_trainer = DPOTrainer(
         model,
@@ -227,6 +232,7 @@ if __name__ == "__main__":
         max_prompt_length=script_args.max_prompt_length,
         generate_during_eval=False,
         peft_config=peft_config,
+        loss_type="sigmoid" if not script_args.adaptive_temp else "adaptive_temp",
         # precompute_ref_log_probs = True
     )
 
