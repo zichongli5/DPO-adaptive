@@ -136,7 +136,7 @@ class DPOTrainer(Trainer):
         ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
         beta: float = 0.1,
         label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto", "adaptive_temp"] = "sigmoid",
+        loss_type: Literal["sigmoid", "hinge", "ipo", "kto", "adaptive_temp", "quadratic"] = "sigmoid",
         args: TrainingArguments = None,
         data_collator: Optional[DataCollator] = None,
         label_pad_token_id: int = -100,
@@ -167,6 +167,8 @@ class DPOTrainer(Trainer):
         tau_min: float = 0.1,
         tau_max: float = 5.0,
         rho: float = 0.2,
+
+        save_results: bool = False,
     ):
         if model_init_kwargs is None:
             model_init_kwargs = {}
@@ -343,6 +345,8 @@ class DPOTrainer(Trainer):
         self.tau_min = tau_min
         self.tau_max = tau_max
         self.rho = rho
+        self.results = []
+        self.save_results = save_results
         ##########################################################################################
 
         # Since ref_logs are precomputed on the first call to get_train/eval_dataloader
@@ -863,6 +867,7 @@ class DPOTrainer(Trainer):
                 -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
                 - F.logsigmoid(-self.beta * logits) * self.label_smoothing
             )
+
         ################################################################################################
         elif self.loss_type == "adaptive_temp":
             logits_detach = (self.beta * logits).clone().detach()
@@ -873,7 +878,27 @@ class DPOTrainer(Trainer):
                 hess_tau = ((logits_detach**2/tau**3)*(1-torch.sigmoid(logits_detach/tau))*torch.sigmoid(logits_detach/tau)).clamp_(min=1e-6)
                 newton_dir = -grad_tau/hess_tau
                 tau = (tau + newton_dir).clamp_(min=self.tau_min, max=self.tau_max)
-            losses = (-tau*torch.log(2*torch.sigmoid(self.beta * logits/tau)+1e-6)).mean()
+            losses = (-tau*torch.log(torch.sigmoid(self.beta * logits/tau)+1e-6)).mean()
+            if self.save_results:
+                result = {'logits': logits_detach.cpu(), 'tau': tau.cpu(), 'loss': losses.detach().cpu(), 'pi_chosen':policy_chosen_logps.detach().cpu(),
+                            'pi_rejected': policy_rejected_logps.detach().cpu(), 'ref_chosen':reference_chosen_logps, 'ref_rejected':reference_rejected_logps}
+                # print(result)
+                self.results.append(result)
+        elif self.loss_type == "quadratic":
+            logits_detach = (self.beta * logits).clone().detach()
+            tau = torch.ones_like(logits_detach)*self.tau_init
+            # Newton method: adding 1e-6 to the inputs of log() for resolving numerical issues
+            for i in range(self.n_tau_iters):
+                grad_tau = -torch.log(2*torch.sigmoid(logits_detach/tau)+1e-6) + (1-torch.sigmoid(logits_detach/tau))*(logits_detach/tau) + 2 * self.rho * tau
+                hess_tau = ((logits_detach**2/tau**3)*(1-torch.sigmoid(logits_detach/tau))*torch.sigmoid(logits_detach/tau) + 2 * self.rho).clamp_(min=1e-6)
+                newton_dir = -grad_tau/hess_tau
+                tau = (tau + newton_dir).clamp_(min=self.tau_min, max=self.tau_max)
+            losses = (-tau*torch.log(torch.sigmoid(self.beta * logits/tau)+1e-6)).mean()
+            if self.save_results:
+                result = {'logits': logits_detach.cpu(), 'tau': tau.cpu(), 'loss': losses.detach().cpu(), 'pi_chosen':policy_chosen_logps.detach().cpu(),
+                            'pi_rejected': policy_rejected_logps.detach().cpu(), 'ref_chosen':reference_chosen_logps, 'ref_rejected':reference_rejected_logps}
+                # print(result)
+                self.results.append(result)
         ################################################################################################
         elif self.loss_type == "hinge":
             losses = torch.relu(1 - self.beta * logits)
@@ -1035,7 +1060,7 @@ class DPOTrainer(Trainer):
                         _,
                         _,
                     ) = self.concatenated_forward(self.ref_model, batch)
-
+        
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
