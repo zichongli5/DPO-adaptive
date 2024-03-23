@@ -19,7 +19,7 @@
 # 0. imports
 from dataclasses import dataclass, field
 from typing import Dict, Optional
-
+import json
 import torch
 from datasets import Dataset, load_dataset
 from peft import LoraConfig
@@ -27,6 +27,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, 
 from transformers import LlamaForCausalLM, LlamaTokenizer
 from trl import create_reference_model
 from dpo_trainer import DPOTrainer
+
+from accelerate import Accelerator, dispatch_model, infer_auto_device_map
+from accelerate.utils import get_balanced_memory
 
 # Define and parse arguments.
 @dataclass
@@ -36,12 +39,20 @@ class ScriptArguments:
     """
 
     # data parameters
-    beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for DPO loss"})
+    beta: Optional[float] = field(default=0.01, metadata={"help": "the beta parameter for DPO loss"})
     
-    adaptive_temp: Optional[bool] = field(default=False, metadata={"help": ""})
+    # adaptive temp parameters
+    loss_type: Optional[str] = field(default="sigmoid", metadata={"help": ""})
+    rho: Optional[float] = field(default=0.1, metadata={"help": ""})
+    tau_max: Optional[float] = field(default=5.0, metadata={"help": ""})
+    tau_min: Optional[float] = field(default=0.1, metadata={"help": ""})
 
     # training parameters
     model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
+
+    eval_steps: Optional[int] = field(default=2800, metadata={"help": "eval steps"})
+    num_train_epochs: Optional[int] = field(default=2, metadata={"help": "num epoch"})
+
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
     per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
@@ -53,7 +64,7 @@ class ScriptArguments:
         default=128, metadata={"help": "Only used for encoder decoder model. Max target of each sample's prompt"}
     )
     label_pad_token_id: Optional[int] = field(default=-100, metadata={"help": "label for non response tokens"})
-    max_steps: Optional[int] = field(default=2048, metadata={"help": "max number of training steps"})
+    max_steps: Optional[int] = field(default=-1, metadata={"help": "max number of training steps"})
     # lora parameters
     use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
     peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
@@ -61,12 +72,21 @@ class ScriptArguments:
     # instrumentation
     sanity_check: Optional[bool] = field(default=True, metadata={"help": "only train on 1000 samples"})
     report_to: Optional[str] = field(
-        default=None,
+        default="tensorboard",
         metadata={
             "help": 'The list of integrations to report the results and logs to. Supported platforms are `"azure_ml"`,'
             '`"comet_ml"`, `"mlflow"`, `"neptune"`, `"tensorboard"`,`"clearml"` and `"wandb"`. '
             'Use `"all"` to report to all integrations installed, `"none"` for no integrations.'
         },
+    )
+    train_path: Optional[str] = field(
+        default=None,
+    )
+    val_path: Optional[str] = field(
+        default=None,
+    )
+    output_path: Optional[str] = field(
+        default=None,
     )
     # debug argument for distributed training
     ignore_bias_buffers: Optional[bool] = field(
@@ -147,15 +167,27 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
 
     return dataset.map(split_prompt_and_responses)
 
+def load_json(path):
+    with open(path, "r") as f:
+        data = json.load(f)
+    return Dataset.from_dict(data)
+
 
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
+    # train_dataset = get_summarize("train", sanity_check=script_args.sanity_check)
+    # print(train_dataset["prompt"][-1])
+    # print(train_dataset["chosen"][-1])
+    # exit()
+
+    
+
     # 1. load a pretrained model
     model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path,
                                                 low_cpu_mem_usage=True,
-                                                torch_dtype=torch.bfloat16
+                                                torch_dtype=torch.bfloat16,
                                                 )
 
     if script_args.ignore_bias_buffers:
@@ -171,8 +203,8 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Load the Anthropic Helpful-Harmless dataset
-    train_dataset = get_summarize("train", sanity_check=script_args.sanity_check)
+    
+    # train_dataset = get_summarize("train", sanity_check=script_args.sanity_check)
     # lengths_prompt = [len(entry.split()) for entry in train_dataset['prompt']]
     # lengths_label = [len(entry.split()) for entry in train_dataset['chosen']] + [len(entry.split()) for entry in train_dataset['rejected']]
     # # Calculate quantiles
@@ -181,27 +213,32 @@ if __name__ == "__main__":
     # print(f"Percentile Prompt: {quantiles}")
     # quantiles = np.percentile(lengths_label, [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
     # print(f"Percentile Label: {quantiles}")
-
+    # 2. Load the dataset
+    train_dataset = load_json(script_args.train_path)
+    eval_dataset = load_json(script_args.val_path)
     # 3. Load evaluation dataset
-    eval_dataset = get_summarize("validation", sanity_check=script_args.sanity_check)
+    # eval_dataset = get_summarize("validation", sanity_check=script_args.sanity_check)
 
     # 4. initialize training arguments:
     training_args = TrainingArguments(
         per_device_train_batch_size=script_args.per_device_train_batch_size,
-        max_steps=script_args.max_steps,
+        per_device_eval_batch_size=script_args.per_device_train_batch_size,
+        num_train_epochs=script_args.num_train_epochs,
         remove_unused_columns=False,
         gradient_accumulation_steps=script_args.gradient_accumulation_steps,
         learning_rate=script_args.learning_rate,
         evaluation_strategy="steps",
         logging_first_step=True,
-        logging_steps=10,  # match results in blog post
-        eval_steps=500,
-        output_dir="./test",
+        logging_steps=10,  # match results in blog post # is 10 in last submit
+        eval_steps=script_args.eval_steps,
+        output_dir=script_args.output_path,
         optim="rmsprop",
         warmup_steps=150,
         report_to=script_args.report_to,
         bf16=True,
+        save_total_limit=1,
         gradient_checkpointing=script_args.gradient_checkpointing,
+        save_strategy="epoch"
         # TODO: uncomment that on the next transformers release
         # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
     )
@@ -232,9 +269,21 @@ if __name__ == "__main__":
         max_prompt_length=script_args.max_prompt_length,
         generate_during_eval=False,
         peft_config=peft_config,
-        loss_type="sigmoid" if not script_args.adaptive_temp else "adaptive_temp",
+        loss_type=script_args.loss_type,
+        rho=script_args.rho,
+        tau_max=script_args.tau_max,
+        tau_min=script_args.tau_min,
+        # ddp_find_unused_parameters=False
         # precompute_ref_log_probs = True
     )
 
     # 6. train
     dpo_trainer.train()
+
+
+
+
+
+
+
+
